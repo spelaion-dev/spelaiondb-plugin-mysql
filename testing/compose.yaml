@@ -1,0 +1,60 @@
+# The servers this plugin's tests run against: the same ones as in SpelaionDB's repository.
+#
+# MySQL 8.4 LTS and MariaDB 11.4 LTS with TLS (not required). The key is copied inside with
+# the owner and permissions the server accepts (one mounted from Windows is rejected).
+# Published on 127.0.0.1:13306 (SPELAION_TEST_MYSQL) and 127.0.0.1:13307 (SPELAION_TEST_MARIADB).
+# `testing/gen-keys.sh` makes the certificates first.
+name: spelaiondb-plugin-mysql-test
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: spelaion-root
+      MYSQL_DATABASE: spelaion
+      MYSQL_USER: spelaion
+      MYSQL_PASSWORD: spelaion
+    ports:
+      - "127.0.0.1:13306:3306"
+    volumes:
+      - ./keys/ca.crt:/certs/ca.crt:ro
+      - ./keys/mysql.crt:/certs/mysql.crt:ro
+      - ./keys/mysql.key:/certs/mysql.key:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /etc/mysql-tls
+        install -o mysql -g mysql -m 600 /certs/mysql.key /etc/mysql-tls/server.key
+        install -o mysql -g mysql -m 644 /certs/mysql.crt /etc/mysql-tls/server.crt
+        install -o mysql -g mysql -m 644 /certs/ca.crt /etc/mysql-tls/ca.crt
+        exec docker-entrypoint.sh mysqld --ssl-ca=/etc/mysql-tls/ca.crt --ssl-cert=/etc/mysql-tls/server.crt --ssl-key=/etc/mysql-tls/server.key --log-bin-trust-function-creators=1
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uspelaion -pspelaion --silent"]
+      interval: 2s
+      retries: 60
+
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: spelaion-root
+      MARIADB_DATABASE: spelaion
+      MARIADB_USER: spelaion
+      MARIADB_PASSWORD: spelaion
+    ports:
+      - "127.0.0.1:13307:3306"
+    volumes:
+      - ./keys/ca.crt:/certs/ca.crt:ro
+      - ./keys/mysql.crt:/certs/mysql.crt:ro
+      - ./keys/mysql.key:/certs/mysql.key:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /etc/mysql-tls
+        install -o mysql -g mysql -m 600 /certs/mysql.key /etc/mysql-tls/server.key
+        install -o mysql -g mysql -m 644 /certs/mysql.crt /etc/mysql-tls/server.crt
+        install -o mysql -g mysql -m 644 /certs/ca.crt /etc/mysql-tls/ca.crt
+        exec docker-entrypoint.sh mariadbd --ssl-ca=/etc/mysql-tls/ca.crt --ssl-cert=/etc/mysql-tls/server.crt --ssl-key=/etc/mysql-tls/server.key
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      retries: 60
