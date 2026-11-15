@@ -4,6 +4,9 @@
 # the owner and permissions the server accepts (one mounted from Windows is rejected).
 # Published on 127.0.0.1:13306 (SPELAION_TEST_MYSQL) and 127.0.0.1:13307 (SPELAION_TEST_MARIADB).
 # `testing/gen-keys.sh` makes the certificates first.
+#
+# TiDB, which speaks MySQL's protocol and is reached through this plugin (SpelaionDB's
+# SDB-170), on 127.0.0.1:14000 (SPELAION_TEST_TIDB), as its image starts: user root, no password.
 name: spelaiondb-plugin-mysql-test
 
 services:
@@ -58,3 +61,9 @@ services:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 2s
       retries: 60
+
+  # No health check: the image has no client to run one. The tests wait until it answers.
+  tidb:
+    image: pingcap/tidb:v8.5.4
+    ports:
+      - "127.0.0.1:14000:4000"

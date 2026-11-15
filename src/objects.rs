@@ -76,7 +76,8 @@ const INTERNAL_ACCOUNTS: &[&str] = &[
 ];
 
 /// Accounts from `mysql.user`, which only privileged users may read: for the others there are
-/// none to show, not an error.
+/// none to show, not an error. Nor on servers that speak MySQL's protocol without a `mysql`
+/// database (SingleStore, StarRocks; SpelaionDB's SDB-170).
 pub(crate) async fn list_server_objects(
     conn: &MysqlConnection,
     flavor: Flavor,
@@ -89,6 +90,13 @@ pub(crate) async fn list_server_objects(
         Ok(rows) => rows,
         Err(DriverError::Database { detail, .. })
             if detail.as_deref() == Some("MySQL error 1142") =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(DriverError::Database { message, .. })
+            if message
+                .to_ascii_lowercase()
+                .contains("unknown database 'mysql'") =>
         {
             return Ok(Vec::new());
         }
