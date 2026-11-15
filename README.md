@@ -20,10 +20,12 @@ this by hand, it comes with SpelaionDB.
 ci/services.sh
 ```
 
-starts the test servers (MySQL 8.4 and MariaDB 11.4 in Docker, with their certificates), and
+starts the test servers (MySQL 8.4 and MariaDB 11.4 in Docker, with their certificates, and
+TiDB and GreptimeDB, which speak MySQL's protocol), and
 
 ```bash
-SPELAION_TEST_MYSQL=127.0.0.1:13306 SPELAION_TEST_MARIADB=127.0.0.1:13307 cargo test
+SPELAION_TEST_MYSQL=127.0.0.1:13306 SPELAION_TEST_MARIADB=127.0.0.1:13307 \
+  SPELAION_TEST_TIDB=127.0.0.1:14000 SPELAION_TEST_GREPTIME=127.0.0.1:14002 cargo test
 ```
 
 runs the type zoo and the protocol's conformance set against this plugin's own program. A

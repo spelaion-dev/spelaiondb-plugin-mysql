@@ -129,6 +129,9 @@ pub(crate) async fn list_columns(
         .collect())
 }
 
+/// The index GreptimeDB lists for a table's time column.
+const TIME_INDEX: &str = "TIME INDEX";
+
 pub(crate) async fn describe_table(
     conn: &MysqlConnection,
     flavor: Flavor,
@@ -189,11 +192,20 @@ pub(crate) async fn describe_table(
         }
     }
     let quote = |s: &str| format!("`{}`", s.replace('`', "``"));
-    let primary_key = indexes
+    let mut primary_key = indexes
         .iter()
         .find(|(index, _, _)| index == "PRIMARY")
         .map(|(_, _, columns)| columns.clone())
         .unwrap_or_default();
+    // GreptimeDB identifies a row by its primary key *and* its time index (two rows may share
+    // the key at different times): a page or an edit by the key alone would reach every one.
+    if let Some((_, _, time)) = indexes.iter().find(|(index, _, _)| index == TIME_INDEX) {
+        for column in time {
+            if !primary_key.contains(column) {
+                primary_key.push(column.clone());
+            }
+        }
+    }
     let indexes = indexes
         .into_iter()
         .map(|(index, unique, columns)| {

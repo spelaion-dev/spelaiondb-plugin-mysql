@@ -7,6 +7,10 @@
 #
 # TiDB, which speaks MySQL's protocol and is reached through this plugin (SpelaionDB's
 # SDB-170), on 127.0.0.1:14000 (SPELAION_TEST_TIDB), as its image starts: user root, no password.
+#
+# GreptimeDB 1.3.1, which also speaks MySQL's protocol (SpelaionDB's SDB-344), on
+# 127.0.0.1:14002 (SPELAION_TEST_GREPTIME), with no login. Its memory is capped, so it can never
+# push another server out of CI's runner.
 name: spelaiondb-plugin-mysql-test
 
 services:
@@ -67,3 +71,14 @@ services:
     image: pingcap/tidb:v8.5.4
     ports:
       - "127.0.0.1:14000:4000"
+
+  greptime:
+    image: greptime/greptimedb:v1.3.1
+    mem_limit: 1g
+    command: [standalone, start, --mysql-addr, 0.0.0.0:4002]
+    ports:
+      - "127.0.0.1:14002:4002"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:4000/health"]
+      interval: 2s
+      retries: 30
