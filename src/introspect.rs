@@ -18,21 +18,18 @@ fn opt(row: &[Option<String>], i: usize) -> Option<String> {
     row.get(i).cloned().flatten().filter(|s| !s.is_empty())
 }
 
-/// MySQL before 8.0.16 parsed CHECK constraints but ignored them. MariaDB is different.
-fn mysql_without_checks(version: &str) -> bool {
-    if version.to_ascii_lowercase().contains("mariadb") {
+/// The error says a catalog table itself is missing (`information_schema.check_constraints`):
+/// MySQL before 8.0.16 has none (it parsed CHECK constraints and ignored them), nor do servers
+/// that speak MySQL's protocol without that catalog (SingleStore, StarRocks; SpelaionDB's
+/// SDB-170). Each words it its own way and with its own code. A permission error or any other
+/// failure is not this.
+fn missing_catalog_table(error: &DriverError, table: &str) -> bool {
+    let DriverError::Database { message, .. } = error else {
         return false;
-    }
-    let mut parts = version.split('.');
-    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
-    let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
-    let patch = parts.next().and_then(|part| {
-        part.split(|c: char| !c.is_ascii_digit())
-            .next()
-            .and_then(|part| part.parse::<u32>().ok())
-    });
-    matches!((major, minor, patch), (Some(5), Some(_), Some(_)))
-        || matches!((major, minor, patch), (Some(8), Some(0), Some(0..=15)))
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains(table)
+        && (message.contains("unknown table") || message.contains("doesn't exist"))
 }
 
 /// `like` as SQL over `column`, its patterns appended to `params` as `?` (ADR-025).
@@ -280,23 +277,10 @@ pub(crate) async fn describe_table(
     let constraint_rows = match constraint_rows {
         Ok(rows) => rows,
         Err(error) => {
-            // Do not hide permission errors, missing tables on newer servers, or MariaDB's
-            // real CHECK constraints. Only retry the known missing catalog on old MySQL.
-            let missing_checks = matches!(
-                &error,
-                DriverError::Database { message, .. }
-                    if message.to_ascii_lowercase().contains("check_constraints")
-                        && message.to_ascii_lowercase().contains("unknown table")
-            );
-            if !missing_checks || !matches!(flavor, Flavor::Mysql) {
-                return Err(error);
-            }
-            let version_rows = conn.rows("select version()", vec![]).await?;
-            let version = version_rows
-                .first()
-                .map(|row| text(row, 0))
-                .unwrap_or_default();
-            if !mysql_without_checks(&version) {
+            // Only a server without the CHECK catalog is read without CHECK constraints: a
+            // permission error, or any other, is not hidden. Such a server has no CHECK
+            // constraints to show.
+            if !missing_catalog_table(&error, "check_constraints") {
                 return Err(error);
             }
             conn.rows(
@@ -403,22 +387,45 @@ fn group_referencing_keys(rows: &[Vec<Option<String>>]) -> Vec<ReferencingKey> {
 
 #[cfg(test)]
 mod tests {
-    use super::mysql_without_checks;
+    use spelaion_driver_api::DriverError;
 
-    #[test]
-    fn old_mysql_has_no_check_constraint_catalog() {
-        for version in ["5.7.44", "5.6.51-log", "8.0.15-commercial"] {
-            assert!(mysql_without_checks(version), "{version}");
+    use super::missing_catalog_table;
+
+    fn database(message: &str) -> DriverError {
+        DriverError::Database {
+            message: message.into(),
+            code: None,
+            detail: None,
+            hint: None,
+            position: None,
         }
-        for version in [
-            "8.0.16",
-            "8.4.0",
-            "9.0.0",
-            "5.5.5-10.11.6-MariaDB",
-            "5.7",
-            "unknown",
+    }
+
+    /// Each server's words for a missing `information_schema.check_constraints`.
+    #[test]
+    fn a_missing_check_catalog_is_recognised_however_the_server_words_it() {
+        for message in [
+            // MySQL before 8.0.16.
+            "Unknown table 'CHECK_CONSTRAINTS' in information_schema",
+            // SingleStore.
+            "Table 'information_schema.check_constraints' doesn't exist",
+            // StarRocks.
+            "Getting analyzing error. Detail message: Unknown table 'information_schema.check_constraints'.",
         ] {
-            assert!(!mysql_without_checks(version), "{version}");
+            assert!(
+                missing_catalog_table(&database(message), "check_constraints"),
+                "{message}"
+            );
+        }
+        for error in [
+            database("SELECT command denied to user 'app'@'%' for table 'check_constraints'"),
+            database("Table 't.other' doesn't exist"),
+            DriverError::Connection("Table 'check_constraints' doesn't exist".into()),
+        ] {
+            assert!(
+                !missing_catalog_table(&error, "check_constraints"),
+                "{error:?}"
+            );
         }
     }
 }
