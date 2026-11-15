@@ -18,35 +18,61 @@ fn opt(row: &[Option<String>], i: usize) -> Option<String> {
     row.get(i).cloned().flatten().filter(|s| !s.is_empty())
 }
 
+/// The catalog tables the explorer's folders read, each as one `select` of name, kind, detail
+/// and comment. Routines of other types (MariaDB's packages, in its Oracle mode) are not listed.
+const SCHEMA_OBJECT_SOURCES: &[&str] = &[
+    "select routine_name as name, lower(routine_type) as kind, null as detail, \
+        routine_comment as comment from information_schema.routines \
+     where routine_schema = ? and routine_type in ('FUNCTION', 'PROCEDURE')",
+    "select table_name, 'sequence', null, table_comment from information_schema.tables \
+     where table_schema = ? and table_type = 'SEQUENCE'",
+    "select trigger_name, 'trigger', event_object_table, null \
+     from information_schema.triggers where trigger_schema = ?",
+    "select event_name, 'event', null, event_comment from information_schema.events \
+     where event_schema = ?",
+];
+
+/// The server's "no such table" (1146): a catalog table it does not have.
+fn missing_table(error: &DriverError) -> bool {
+    matches!(error, DriverError::Database { detail, .. } if detail.as_deref() == Some("MySQL error 1146"))
+}
+
 pub(crate) async fn list_schema_objects(
     conn: &MysqlConnection,
     schema: &str,
     like: &LikeFilter,
 ) -> Result<Vec<SchemaObject>> {
-    let mut params = vec![schema.to_string(); 4];
-    let narrow = like_sql(like, "o.name", &mut params);
-    // Routines of other types (MariaDB's packages, in its Oracle mode) are not listed.
-    let rows = conn
-        .rows(
-            &format!(
-                "select * from (select routine_name as name, lower(routine_type) as kind, \
-                    null as detail, routine_comment as comment \
-             from information_schema.routines \
-             where routine_schema = ? and routine_type in ('FUNCTION', 'PROCEDURE') \
-             union all \
-             select table_name, 'sequence', null, table_comment from information_schema.tables \
-             where table_schema = ? and table_type = 'SEQUENCE' \
-             union all \
-             select trigger_name, 'trigger', event_object_table, null \
-             from information_schema.triggers where trigger_schema = ? \
-             union all \
-             select event_name, 'event', null, event_comment from information_schema.events \
-             where event_schema = ?) o where true{narrow} \
-             order by 1, 2"
+    let query = |sources: &[&str]| {
+        let mut params = vec![schema.to_string(); sources.len()];
+        let narrow = like_sql(like, "o.name", &mut params);
+        (
+            format!(
+                "select * from ({}) o where true{narrow} order by 1, 2",
+                sources.join(" union all ")
             ),
             params,
         )
-        .await?;
+    };
+    let (sql, params) = query(SCHEMA_OBJECT_SOURCES);
+    let rows = match conn.rows(&sql, params).await {
+        Ok(rows) => rows,
+        // A server of MySQL's protocol without some of these tables (GreptimeDB has no
+        // `information_schema.triggers`): each one alone, and the missing ones have nothing.
+        Err(error) if missing_table(&error) => {
+            let mut rows = Vec::new();
+            for source in SCHEMA_OBJECT_SOURCES {
+                let (sql, params) = query(&[source]);
+                match conn.rows(&sql, params).await {
+                    Ok(found) => rows.extend(found),
+                    Err(error) if missing_table(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            rows.sort_by_key(|row| (text(row, 0), text(row, 1)));
+            rows
+        }
+        Err(error) => return Err(error),
+    };
     rows.iter()
         .map(|row| {
             Ok(SchemaObject {
@@ -77,7 +103,8 @@ const INTERNAL_ACCOUNTS: &[&str] = &[
 
 /// Accounts from `mysql.user`, which only privileged users may read: for the others there are
 /// none to show, not an error. Nor on servers that speak MySQL's protocol without a `mysql`
-/// database (SingleStore, StarRocks; SpelaionDB's SDB-170).
+/// database (SingleStore, StarRocks; SpelaionDB's SDB-170) or without its `user` table
+/// (GreptimeDB).
 pub(crate) async fn list_server_objects(
     conn: &MysqlConnection,
     flavor: Flavor,
@@ -100,6 +127,7 @@ pub(crate) async fn list_server_objects(
         {
             return Ok(Vec::new());
         }
+        Err(error) if missing_table(&error) => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     Ok(rows

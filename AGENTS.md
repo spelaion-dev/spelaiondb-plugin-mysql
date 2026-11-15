@@ -76,7 +76,8 @@ identifier in the pull request's description, never in a commit subject.
 - `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`.
 - The tests against a real server (without the variable they are skipped, and that does
   **not** count as tested): `ci/services.sh` and
-  `SPELAION_TEST_MYSQL=127.0.0.1:13306 SPELAION_TEST_MARIADB=127.0.0.1:13307 cargo test`.
+  `SPELAION_TEST_MYSQL=127.0.0.1:13306 SPELAION_TEST_MARIADB=127.0.0.1:13307
+  SPELAION_TEST_TIDB=127.0.0.1:14000 SPELAION_TEST_GREPTIME=127.0.0.1:14002 cargo test`.
 - `cargo deny check` if dependencies change.
 - A change to how values are written is checked against SpelaionDB too: build this program and
   run SpelaionDB's tests through it (`SPELAION_DEV_PLUGIN_MYSQL` and `SPELAION_DEV_PLUGIN_MARIADB`, both `<this program>`, with a

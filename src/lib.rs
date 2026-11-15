@@ -153,11 +153,16 @@ impl Driver for MysqlDriver {
             other => other,
         }
         .map_err(map_error)?;
-        let cancel = Arc::new(MysqlCancel {
-            opts,
-            timeout,
-            id: conn.id(),
-        });
+        // The id `KILL` names, as the server counts it: GreptimeDB's handshake gives another
+        // number than its `connection_id()`, which its process ids end with.
+        let mut conn = conn;
+        let id = conn
+            .query_first::<u32, _>("select connection_id()")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| conn.id());
+        let cancel = Arc::new(MysqlCancel { opts, timeout, id });
         let (requests, receiver) = mpsc::channel(8);
         tokio::spawn(actor(conn, receiver, Some(params.database.clone())));
         Ok(Box::new(MysqlConnection {
@@ -809,10 +814,30 @@ impl CancelHandle for MysqlCancel {
         let mut conn = open(self.opts.clone(), self.timeout)
             .await
             .map_err(map_error)?;
-        let result = conn.query_drop(format!("KILL QUERY {}", self.id)).await;
+        let result = cancel_on(&mut conn, self.id).await;
         let _ = conn.disconnect().await;
         result.map_err(map_error)
     }
+}
+
+/// `KILL QUERY` of connection `id`. GreptimeDB accepts that and stops nothing: its queries are
+/// killed by their process id, `<frontend>/<connection id>`, read from its process list.
+async fn cancel_on(conn: &mut Conn, id: u32) -> std::result::Result<(), mysql_async::Error> {
+    let version: Option<String> = conn.query_first("select version()").await?;
+    if version.is_some_and(|v| v.contains("GreptimeDB")) {
+        let process: Option<String> = conn
+            .exec_first(
+                "select id from information_schema.process_list where id like ?",
+                (format!("%/{id}"),),
+            )
+            .await?;
+        if let Some(process) = process {
+            conn.query_drop(format!("KILL '{}'", process.replace('\'', "''")))
+                .await?;
+        }
+        return Ok(());
+    }
+    conn.query_drop(format!("KILL QUERY {id}")).await
 }
 
 /// Server errors keep their SQLSTATE as `code` (`28000` = access denied, like PostgreSQL)
