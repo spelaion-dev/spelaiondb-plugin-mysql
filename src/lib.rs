@@ -186,8 +186,13 @@ impl Driver for MysqlDriver {
                 explain: true,
                 editable_results: false,
                 schemas: true,
-                insert_rows: true,
-                bound_params: true,
+                // An import binds every value as text, which GreptimeDB's prepared inserts do not
+                // convert ("Expected type: Float64, actual: MYSQL_TYPE_VAR_STRING"): its import is
+                // refused, not half done.
+                insert_rows: greptime.is_none(),
+                // Values are bound to user variables, which GreptimeDB does not have ("variable
+                // has no type information"): its data search is refused, not sent.
+                bound_params: greptime.is_none(),
             },
         }))
     }
