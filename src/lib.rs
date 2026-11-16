@@ -153,22 +153,33 @@ impl Driver for MysqlDriver {
             other => other,
         }
         .map_err(map_error)?;
-        // The id `KILL` names, as the server counts it: GreptimeDB's handshake gives another
-        // number than its `connection_id()`, which its process ids end with.
+        // GreptimeDB speaks MySQL's protocol but cancels, and keys its rows, its own way. Its
+        // handshake gives another number than its `connection_id()`, which its process ids end
+        // with. Every other server keeps the handshake's id, exactly as before (a proxy may answer
+        // `connection_id()` with a server's id that its own `KILL` does not know).
         let mut conn = conn;
-        let id = conn
-            .query_first::<u32, _>("select connection_id()")
+        let greptime = match conn
+            .query_first::<(Option<String>, Option<u32>), _>("select version(), connection_id()")
             .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| conn.id());
-        let cancel = Arc::new(MysqlCancel { opts, timeout, id });
+        {
+            Ok(Some((Some(version), Some(id)))) if is_greptime(&version) => Some(id),
+            _ => None,
+        };
+        let cancel = Arc::new(MysqlCancel {
+            opts,
+            timeout,
+            target: match greptime {
+                Some(id) => CancelTarget::Greptime(id),
+                None => CancelTarget::Mysql(conn.id()),
+            },
+        });
         let (requests, receiver) = mpsc::channel(8);
         tokio::spawn(actor(conn, receiver, Some(params.database.clone())));
         Ok(Box::new(MysqlConnection {
             requests,
             cancel,
             flavor: self.flavor,
+            greptime: greptime.is_some(),
             capabilities: Capabilities {
                 transactions: true,
                 cancel: true,
@@ -566,7 +577,14 @@ struct MysqlConnection {
     requests: mpsc::Sender<Request>,
     cancel: Arc<MysqlCancel>,
     flavor: Flavor,
+    /// The server said it is GreptimeDB when the connection opened.
+    greptime: bool,
     capabilities: Capabilities,
+}
+
+/// GreptimeDB's `version()` ends with its own name and release (`8.4.2-GreptimeDB-1.3.1`).
+fn is_greptime(version: &str) -> bool {
+    version.to_ascii_lowercase().contains("greptimedb")
 }
 
 fn closed() -> DriverError {
@@ -761,7 +779,7 @@ impl Connection for MysqlConnection {
     }
 
     async fn describe_table(&self, schema: &str, name: &str) -> Result<TableInfo> {
-        introspect::describe_table(self, self.flavor, schema, name).await
+        introspect::describe_table(self, self.flavor, self.greptime, schema, name).await
     }
 
     async fn list_columns(&self, schema: &str) -> Result<Vec<SchemaColumn>> {
@@ -805,7 +823,16 @@ fn tokio_stream_from<T: Send + 'static>(
 struct MysqlCancel {
     opts: Opts,
     timeout: Duration,
-    id: u32,
+    target: CancelTarget,
+}
+
+/// What a cancel names, read when the connection opened.
+#[derive(Debug, Clone, Copy)]
+enum CancelTarget {
+    /// The handshake's connection id, for `KILL QUERY`.
+    Mysql(u32),
+    /// GreptimeDB's `connection_id()`, the end of its process id.
+    Greptime(u32),
 }
 
 #[async_trait]
@@ -814,30 +841,36 @@ impl CancelHandle for MysqlCancel {
         let mut conn = open(self.opts.clone(), self.timeout)
             .await
             .map_err(map_error)?;
-        let result = cancel_on(&mut conn, self.id).await;
+        let result = cancel_on(&mut conn, self.target).await;
         let _ = conn.disconnect().await;
         result.map_err(map_error)
     }
 }
 
-/// `KILL QUERY` of connection `id`. GreptimeDB accepts that and stops nothing: its queries are
-/// killed by their process id, `<frontend>/<connection id>`, read from its process list.
-async fn cancel_on(conn: &mut Conn, id: u32) -> std::result::Result<(), mysql_async::Error> {
-    let version: Option<String> = conn.query_first("select version()").await?;
-    if version.is_some_and(|v| v.contains("GreptimeDB")) {
-        let process: Option<String> = conn
-            .exec_first(
-                "select id from information_schema.process_list where id like ?",
-                (format!("%/{id}"),),
-            )
-            .await?;
-        if let Some(process) = process {
-            conn.query_drop(format!("KILL '{}'", process.replace('\'', "''")))
+/// `KILL QUERY` of the connection. GreptimeDB accepts that and stops nothing: its queries are
+/// killed by their process id, `<frontend>/<connection id>`, read from its process list. Only
+/// a single match is killed: with several frontends, the same connection id on another one is
+/// someone else's query.
+async fn cancel_on(
+    conn: &mut Conn,
+    target: CancelTarget,
+) -> std::result::Result<(), mysql_async::Error> {
+    match target {
+        CancelTarget::Mysql(id) => conn.query_drop(format!("KILL QUERY {id}")).await,
+        CancelTarget::Greptime(id) => {
+            let processes: Vec<String> = conn
+                .exec(
+                    "select id from information_schema.process_list where id like ?",
+                    (format!("%/{id}"),),
+                )
                 .await?;
+            if let [process] = processes.as_slice() {
+                conn.query_drop(format!("KILL '{}'", process.replace('\'', "''")))
+                    .await?;
+            }
+            Ok(())
         }
-        return Ok(());
     }
-    conn.query_drop(format!("KILL QUERY {id}")).await
 }
 
 /// Server errors keep their SQLSTATE as `code` (`28000` = access denied, like PostgreSQL)
