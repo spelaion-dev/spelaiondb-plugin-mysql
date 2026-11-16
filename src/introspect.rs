@@ -132,9 +132,54 @@ pub(crate) async fn list_columns(
 /// The index GreptimeDB lists for a table's time column.
 const TIME_INDEX: &str = "TIME INDEX";
 
+/// The columns that identify one row of a GreptimeDB table. A table keeps one row per primary
+/// key and time index (a later insert replaces it), so both together are its identity; an
+/// append-only table (`append_mode = 'true'`) keeps every row, even equal ones, so nothing
+/// identifies one and it has no key (pages and edits then refuse it, as on a table without a
+/// primary key).
+async fn greptime_row_key(
+    conn: &MysqlConnection,
+    schema: &str,
+    name: &str,
+    mut primary_key: Vec<String>,
+    indexes: &[(String, bool, Vec<String>)],
+) -> Result<Vec<String>> {
+    // `ttl=7days append_mode=true compaction.type=twcs`, as GreptimeDB 1.3 writes it.
+    let options = conn
+        .rows(
+            "select create_options from information_schema.tables \
+             where table_schema = ? and table_name = ?",
+            vec![schema.to_string(), name.to_string()],
+        )
+        .await?;
+    let append_only = options
+        .first()
+        .and_then(|row| row.first().cloned().flatten())
+        .is_some_and(|options| is_append_only(&options));
+    if append_only {
+        return Ok(Vec::new());
+    }
+    if let Some((_, _, time)) = indexes.iter().find(|(index, _, _)| index == TIME_INDEX) {
+        for column in time {
+            if !primary_key.contains(column) {
+                primary_key.push(column.clone());
+            }
+        }
+    }
+    Ok(primary_key)
+}
+
+/// Whether GreptimeDB's `create_options` say the table keeps duplicate rows.
+fn is_append_only(options: &str) -> bool {
+    options
+        .split_whitespace()
+        .any(|option| option.eq_ignore_ascii_case("append_mode=true"))
+}
+
 pub(crate) async fn describe_table(
     conn: &MysqlConnection,
     flavor: Flavor,
+    greptime: bool,
     schema: &str,
     name: &str,
 ) -> Result<TableInfo> {
@@ -199,12 +244,9 @@ pub(crate) async fn describe_table(
         .unwrap_or_default();
     // GreptimeDB identifies a row by its primary key *and* its time index (two rows may share
     // the key at different times): a page or an edit by the key alone would reach every one.
-    if let Some((_, _, time)) = indexes.iter().find(|(index, _, _)| index == TIME_INDEX) {
-        for column in time {
-            if !primary_key.contains(column) {
-                primary_key.push(column.clone());
-            }
-        }
+    // Only on GreptimeDB: on MySQL an index of that name is any index, unique or not.
+    if greptime {
+        primary_key = greptime_row_key(conn, schema, name, primary_key, &indexes).await?;
     }
     let indexes = indexes
         .into_iter()
@@ -401,7 +443,21 @@ fn group_referencing_keys(rows: &[Vec<Option<String>>]) -> Vec<ReferencingKey> {
 mod tests {
     use spelaion_driver_api::DriverError;
 
-    use super::missing_catalog_table;
+    use super::{is_append_only, missing_catalog_table};
+
+    /// GreptimeDB's `create_options`, as 1.3.1 writes them for `WITH (...)`.
+    #[test]
+    fn append_only_tables_are_read_from_their_options() {
+        for options in [
+            "append_mode=true",
+            "ttl=7days append_mode=true compaction.override=true compaction.type=twcs",
+        ] {
+            assert!(is_append_only(options), "{options}");
+        }
+        for options in ["", "append_mode=false", "ttl=7days", "x_append_mode=true"] {
+            assert!(!is_append_only(options), "{options}");
+        }
+    }
 
     fn database(message: &str) -> DriverError {
         DriverError::Database {
