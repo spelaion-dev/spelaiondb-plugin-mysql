@@ -83,8 +83,17 @@ fn opts(params: &ConnectParams, tls: Option<SslOpts>) -> Opts {
         // TCP keepalive after a minute idle, so a NAT in front of the server does not drop a
         // direct connection (ADR-028).
         .tcp_keepalive(Some(Duration::from_secs(60)))
+        // `mysql_clear_password` (SpelaionDB's SDB-396), only when the core sends the option:
+        // the core sends it only for a connection whose TLS checks the server's certificate or
+        // that goes through an SSH tunnel, and refuses to open any other.
+        .enable_cleartext_plugin(cleartext_allowed(params))
         .ssl_opts(tls)
         .into()
+}
+
+/// The core's option for MySQL's cleartext password plugin (`cleartext_password = on`).
+fn cleartext_allowed(params: &ConnectParams) -> bool {
+    params.options.get("cleartext_password").map(String::as_str) == Some("on")
 }
 
 /// libpq-style modes mapped to MySQL TLS options. `Prefer` is handled by the caller (it
@@ -937,6 +946,28 @@ fn map_error_in(e: mysql_async::Error, sql: &str) -> DriverError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cleartext_plugin_is_answered_only_when_the_core_says_so() {
+        let mut params = ConnectParams {
+            host: "db.internal".into(),
+            port: 3306,
+            ..Default::default()
+        };
+        assert!(!opts(&params, None).enable_cleartext_plugin());
+        for other in ["off", "true", "ON", ""] {
+            params
+                .options
+                .insert("cleartext_password".into(), other.into());
+            assert!(!opts(&params, None).enable_cleartext_plugin(), "{other:?}");
+        }
+        params
+            .options
+            .insert("cleartext_password".into(), "on".into());
+        assert!(opts(&params, None).enable_cleartext_plugin());
+        // The retry without TLS (`prefer`) keeps the same choice.
+        assert!(opts(&params, tls_opts(&params)).enable_cleartext_plugin());
+    }
 
     #[test]
     fn only_counted_statements_report_rows() {
