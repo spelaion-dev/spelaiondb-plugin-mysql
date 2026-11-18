@@ -4,8 +4,10 @@
 //! through channels, so a long query never blocks anything else. Statements use the text
 //! protocol: values arrive exactly as the server writes them and [`decode`] turns them into
 //! Arrow columns. Cancelling sends `KILL QUERY` over a second connection, which also goes
-//! through the SSH tunnel when there is one.
+//! through the SSH tunnel when there is one; a cancel is remembered for what was sent before
+//! it ([`cancel`]).
 
+mod cancel;
 mod decode;
 use spelaion_dialect::mysql as dialect;
 mod introspect;
@@ -174,19 +176,25 @@ impl Driver for MysqlDriver {
             Ok(Some((Some(version), Some(id)))) if is_greptime(&version) => Some(id),
             _ => None,
         };
-        let cancel = Arc::new(MysqlCancel {
+        let canceller = cancel::Canceller::new(
             opts,
             timeout,
-            target: match greptime {
-                Some(id) => CancelTarget::Greptime(id),
-                None => CancelTarget::Mysql(conn.id()),
+            match greptime {
+                Some(id) => cancel::CancelTarget::Greptime(id),
+                None => cancel::CancelTarget::Mysql(conn.id()),
             },
-        });
+        );
         let (requests, receiver) = mpsc::channel(8);
-        tokio::spawn(actor(conn, receiver, Some(params.database.clone())));
+        tokio::spawn(actor(
+            conn,
+            receiver,
+            Some(params.database.clone()),
+            canceller.clone(),
+        ));
         Ok(Box::new(MysqlConnection {
             requests,
-            cancel,
+            sending: tokio::sync::Mutex::new(()),
+            cancel: Arc::new(cancel::MysqlCancel(canceller)),
             flavor: self.flavor,
             greptime: greptime.is_some(),
             capabilities: Capabilities {
@@ -217,6 +225,8 @@ enum Request {
         reply: oneshot::Sender<Result<Option<String>>>,
     },
     Execute {
+        /// Its number for cancelling (`cancel::Canceller::submit`).
+        id: u64,
         sql: String,
         /// Bound to `@spelaion_p1`, `@spelaion_p2`… before the statement runs (ADR-043).
         params: Vec<String>,
@@ -246,24 +256,44 @@ enum Request {
 }
 
 /// Owns the connection until every handle is dropped.
-async fn actor(mut conn: Conn, mut requests: mpsc::Receiver<Request>, database: Option<String>) {
+async fn actor(
+    mut conn: Conn,
+    mut requests: mpsc::Receiver<Request>,
+    database: Option<String>,
+    canceller: Arc<cancel::Canceller>,
+) {
     let mut context = DatabaseContext::new(ContextDialect::Mysql, database);
     // An error is an ERR packet, which carries no status: the last OK packet may be older than
     // a deadlock that rolled the transaction back.
     let mut status_stale = false;
     while let Some(request) = requests.recv().await {
+        // Nothing reaches the server while a cancel's `KILL QUERY` is on its way (SDB-222).
+        let id = match &request {
+            Request::Execute { id, .. } => Some(*id),
+            _ => None,
+        };
+        if let cancel::Begin::Skip = canceller.begin(id).await {
+            // Cancelled before it started: it never runs.
+            if let Request::Execute { events, .. } = request {
+                let _ = events.send(Err(DriverError::Cancelled)).await;
+            }
+            continue;
+        }
         match request {
             Request::Execute {
+                id,
                 sql,
                 params,
                 batch_size,
                 events,
             } => {
+                let killed = || canceller.killed(id);
                 let outcome = if params.is_empty() {
-                    execute(&mut conn, &sql, batch_size, &events).await
+                    execute(&mut conn, &sql, batch_size, &events, &killed).await
                 } else {
-                    execute_bound(&mut conn, &sql, params, batch_size, &events).await
+                    execute_bound(&mut conn, &sql, params, batch_size, &events, &killed).await
                 };
+                canceller.end(id);
                 let complete = matches!(outcome, ExecutionOutcome::Complete);
                 context.observe(&sql, complete);
                 if matches!(outcome, ExecutionOutcome::Uncertain) {
@@ -329,6 +359,7 @@ async fn actor(mut conn: Conn, mut requests: mpsc::Receiver<Request>, database: 
             }
         }
     }
+    canceller.close();
     let _ = conn.disconnect().await;
 }
 
@@ -384,6 +415,7 @@ async fn execute(
     sql: &str,
     batch_size: usize,
     events: &mpsc::Sender<Result<ExecEvent>>,
+    killed: &(dyn Fn() -> bool + Sync),
 ) -> ExecutionOutcome {
     let send = |event| async move { events.send(event).await.is_ok() };
     let mut result = match conn.query_iter(sql).await {
@@ -470,6 +502,12 @@ async fn execute(
             }
         }
     }
+    // A statement killed while it ran may still end without an error (MySQL's `SLEEP()`
+    // returns 1): it was cancelled, and says so (SDB-222).
+    if killed() {
+        send(Err(DriverError::Cancelled)).await;
+        return ExecutionOutcome::Complete;
+    }
     send(Ok(ExecEvent::Done { rows_affected })).await;
     ExecutionOutcome::Complete
 }
@@ -483,6 +521,7 @@ async fn execute_bound(
     params: Vec<String>,
     batch_size: usize,
     events: &mpsc::Sender<Result<ExecEvent>>,
+    killed: &(dyn Fn() -> bool + Sync),
 ) -> ExecutionOutcome {
     let names: Vec<String> = (1..=params.len())
         .map(|n| spelaion_driver_api::bound_placeholder("mysql", n))
@@ -506,7 +545,7 @@ async fn execute_bound(
         let _ = events.send(Err(map_error(e))).await;
         return ExecutionOutcome::Failed;
     }
-    let outcome = execute(conn, sql, batch_size, events).await;
+    let outcome = execute(conn, sql, batch_size, events, killed).await;
     let clear = names
         .iter()
         .map(|name| format!("{name} = NULL"))
@@ -589,7 +628,9 @@ async fn first_event(
 
 struct MysqlConnection {
     requests: mpsc::Sender<Request>,
-    cancel: Arc<MysqlCancel>,
+    /// Statements are numbered and sent under it, so they reach the actor in number order.
+    sending: tokio::sync::Mutex<()>,
+    cancel: Arc<cancel::MysqlCancel>,
     flavor: Flavor,
     /// The server said it is GreptimeDB when the connection opened.
     greptime: bool,
@@ -606,6 +647,32 @@ fn closed() -> DriverError {
 }
 
 impl MysqlConnection {
+    /// Numbers a statement for cancelling and sends it to the actor (SDB-222).
+    async fn send_statement(
+        &self,
+        sql: &str,
+        params: Vec<String>,
+        opts: &ExecOptions,
+    ) -> Result<EventStream> {
+        let (events, receiver) = mpsc::channel(4);
+        {
+            let _order = self.sending.lock().await;
+            let id = self.cancel.0.submit();
+            let request = Request::Execute {
+                id,
+                sql: sql.to_string(),
+                params,
+                batch_size: opts.batch_size.max(1),
+                events,
+            };
+            if self.requests.send(request).await.is_err() {
+                self.cancel.0.not_sent(id);
+                return Err(closed());
+            }
+        }
+        first_event(tokio_stream_from(receiver)).await
+    }
+
     pub(crate) async fn rows(&self, sql: &str, params: Vec<String>) -> Result<Rows> {
         let (reply, response) = oneshot::channel();
         self.requests
@@ -627,17 +694,7 @@ impl Connection for MysqlConnection {
     }
 
     async fn execute(&self, sql: &str, opts: &ExecOptions) -> Result<EventStream> {
-        let (events, receiver) = mpsc::channel(4);
-        self.requests
-            .send(Request::Execute {
-                sql: sql.to_string(),
-                params: Vec::new(),
-                batch_size: opts.batch_size.max(1),
-                events,
-            })
-            .await
-            .map_err(|_| closed())?;
-        first_event(tokio_stream_from(receiver)).await
+        self.send_statement(sql, Vec::new(), opts).await
     }
 
     async fn execute_bound(
@@ -646,17 +703,7 @@ impl Connection for MysqlConnection {
         params: Vec<String>,
         opts: &ExecOptions,
     ) -> Result<EventStream> {
-        let (events, receiver) = mpsc::channel(4);
-        self.requests
-            .send(Request::Execute {
-                sql: sql.to_string(),
-                params,
-                batch_size: opts.batch_size.max(1),
-                events,
-            })
-            .await
-            .map_err(|_| closed())?;
-        first_event(tokio_stream_from(receiver)).await
+        self.send_statement(sql, params, opts).await
     }
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
@@ -831,60 +878,6 @@ fn tokio_stream_from<T: Send + 'static>(
     Box::pin(futures_util::stream::poll_fn(move |cx| {
         receiver.poll_recv(cx)
     }))
-}
-
-/// `KILL QUERY` from a second connection with the same options (and the same tunnel).
-struct MysqlCancel {
-    opts: Opts,
-    timeout: Duration,
-    target: CancelTarget,
-}
-
-/// What a cancel names, read when the connection opened.
-#[derive(Debug, Clone, Copy)]
-enum CancelTarget {
-    /// The handshake's connection id, for `KILL QUERY`.
-    Mysql(u32),
-    /// GreptimeDB's `connection_id()`, the end of its process id.
-    Greptime(u32),
-}
-
-#[async_trait]
-impl CancelHandle for MysqlCancel {
-    async fn cancel(&self) -> Result<()> {
-        let mut conn = open(self.opts.clone(), self.timeout)
-            .await
-            .map_err(map_error)?;
-        let result = cancel_on(&mut conn, self.target).await;
-        let _ = conn.disconnect().await;
-        result.map_err(map_error)
-    }
-}
-
-/// `KILL QUERY` of the connection. GreptimeDB accepts that and stops nothing: its queries are
-/// killed by their process id, `<frontend>/<connection id>`, read from its process list. Only
-/// a single match is killed: with several frontends, the same connection id on another one is
-/// someone else's query.
-async fn cancel_on(
-    conn: &mut Conn,
-    target: CancelTarget,
-) -> std::result::Result<(), mysql_async::Error> {
-    match target {
-        CancelTarget::Mysql(id) => conn.query_drop(format!("KILL QUERY {id}")).await,
-        CancelTarget::Greptime(id) => {
-            let processes: Vec<String> = conn
-                .exec(
-                    "select id from information_schema.process_list where id like ?",
-                    (format!("%/{id}"),),
-                )
-                .await?;
-            if let [process] = processes.as_slice() {
-                conn.query_drop(format!("KILL '{}'", process.replace('\'', "''")))
-                    .await?;
-            }
-            Ok(())
-        }
-    }
 }
 
 /// Server errors keep their SQLSTATE as `code` (`28000` = access denied, like PostgreSQL)
