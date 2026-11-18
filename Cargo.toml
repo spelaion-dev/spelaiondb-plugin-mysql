@@ -1,7 +1,7 @@
 [package]
 name = "spelaiondb-plugin-mysql"
 description = "MySQL and MariaDB for SpelaionDB: the engines' driver, served as a plugin"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/spelaion-dev/spelaiondb-plugin-mysql"
@@ -19,9 +19,9 @@ path = "src/bin/spelaiondb-plugin-mysql.rs"
 # SpelaionDB's repository, by tag (ADR-042): they are one workspace there, so one tag pins
 # them together. Moving the tag is how this plugin follows a protocol change.
 [dependencies]
-spelaion-driver-api = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.1.1" }
-spelaion-dialect = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.1.1" }
-spelaion-plugin-sdk = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.1.1" }
+spelaion-driver-api = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.3.1" }
+spelaion-dialect = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.3.1" }
+spelaion-plugin-sdk = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.3.1" }
 # The same Arrow as SpelaionDB's: batches cross the two unchanged.
 arrow = { version = "60", default-features = false, features = ["ipc"] }
 async-trait = "0.1"
@@ -35,7 +35,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 [dev-dependencies]
 insta = "1"
 # The conformance set every plugin runs against its own program (tests/conformance.rs).
-spelaion-plugin-host = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.1.1" }
+spelaion-plugin-host = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.3.1" }
 
 # mysql_async patched so verify-ca skips the name check (vendor/mysql_async/PATCHED.md): read
 # it before upgrading.
