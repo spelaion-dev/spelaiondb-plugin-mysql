@@ -7,6 +7,7 @@
 //! through the SSH tunnel when there is one.
 
 mod decode;
+mod details;
 use spelaion_dialect::mysql as dialect;
 mod introspect;
 mod objects;
@@ -21,10 +22,10 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts};
 use spelaion_driver_api::{
     CancelHandle, Capabilities, ColumnMeta, ConnectParams, Connection, ContextDialect,
-    DatabaseContext, Dialect, Driver, DriverError, EventStream, ExecEvent, ExecOptions,
-    InsertTarget, KeepAlive, LikeFilter, NameFilter, Notice, ObjectInfo, ReferencingKey, Result,
-    ResultSchema, SchemaColumn, SchemaInfo, SchemaObject, ServerObject, TableInfo, TextRows,
-    TlsMode, TransactionState,
+    DatabaseContext, Dependencies, Dialect, Driver, DriverError, EventStream, ExecEvent,
+    ExecOptions, InsertTarget, KeepAlive, LikeFilter, NameFilter, Notice, ObjectInfo,
+    ObjectProperty, Partitioning, ReferencingKey, Result, ResultSchema, SchemaColumn, SchemaInfo,
+    SchemaObject, ServerObject, TableInfo, TextRows, TlsMode, TransactionState,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -809,6 +810,18 @@ impl Connection for MysqlConnection {
 
     async fn relation_definition(&self, schema: &str, name: &str) -> Result<String> {
         objects::relation_definition(self, schema, name).await
+    }
+
+    async fn object_properties(&self, schema: &str, name: &str) -> Result<Vec<ObjectProperty>> {
+        details::properties(self, schema, name).await
+    }
+
+    async fn table_partitions(&self, schema: &str, name: &str) -> Result<Option<Partitioning>> {
+        details::partitions(self, schema, name).await
+    }
+
+    async fn object_dependencies(&self, schema: &str, name: &str) -> Result<Option<Dependencies>> {
+        details::dependencies(self, schema, name).await
     }
 
     async fn procedure_call(&self, object: &SchemaObject) -> Result<String> {
