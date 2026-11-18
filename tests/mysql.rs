@@ -707,6 +707,198 @@ async fn introspection_lists_tables_columns_keys_and_indexes() {
     }
 }
 
+/// Runs `body`, then `cleanup` even when the body panicked: the test servers are shared, and
+/// what a failed run leaves behind breaks other tests (SpelaionDB's `tests/support`'s
+/// `cleaning_up`). The cleanup is best effort; the body's own failure is the one reported.
+async fn cleaning_up<T, C>(
+    body: impl std::future::Future<Output = T>,
+    cleanup: impl FnOnce() -> C,
+) -> T
+where
+    C: std::future::Future<Output = ()>,
+{
+    use futures_util::FutureExt;
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    cleanup().await;
+    match outcome {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// A relation's properties, partitions and dependencies (SpelaionDB's SDB-393), read from
+/// `information_schema`: MariaDB does not record what a view reads, and says so.
+#[tokio::test]
+async fn object_details_are_read_from_the_catalog() {
+    for server in servers() {
+        let conn = server.connect().await;
+        let pid = std::process::id();
+        let drops = [
+            format!("drop view if exists det_view_{pid}"),
+            format!("drop table if exists det_child_{pid}"),
+            format!("drop table if exists det_orders_{pid}"),
+            format!("drop table if exists det_customer_{pid}"),
+        ];
+        cleaning_up(details_on(server.label, &*conn, pid), || async {
+            for drop in &drops {
+                let _ = run(&*conn, drop).await;
+            }
+        })
+        .await;
+    }
+}
+
+async fn details_on(label: &str, conn: &dyn Connection, pid: u32) {
+    let (customer, orders, view, trigger) = (
+        format!("det_customer_{pid}"),
+        format!("det_orders_{pid}"),
+        format!("det_view_{pid}"),
+        format!("det_trigger_{pid}"),
+    );
+    for stmt in [
+        format!("drop view if exists {view}"),
+        format!("drop table if exists {orders}"),
+        format!("drop table if exists {customer}"),
+        format!(
+            "create table {customer} (id int primary key, email varchar(80)) engine = InnoDB                  default charset = utf8mb4 collate = utf8mb4_bin comment = 'who'"
+        ),
+        format!(
+            "create table {orders} (id int, customer_id int, at date not null,                  primary key (id, at), key (customer_id))                  partition by range (year(at)) (partition p2024 values less than (2025),                  partition p2025 values less than (2026), partition pmax values less than maxvalue)"
+        ),
+        format!(
+            "create table det_child_{pid} (id int primary key, customer int,                      foreign key (customer) references {customer} (id))"
+        ),
+        format!("create view {view} as select email from {customer}"),
+        format!(
+            "create trigger {trigger} before insert on {customer} for each row set new.email = lower(new.email)"
+        ),
+    ] {
+        run(conn, &stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {stmt}: {e:?}"));
+    }
+
+    let properties: Vec<String> = conn
+        .object_properties("spelaion", &customer)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    for expected in ["engine", "collation", "charset", "created", "row_format"] {
+        assert!(
+            properties.iter().any(|p| p == expected),
+            "{label}: {properties:?}"
+        );
+    }
+    let engine = conn
+        .object_properties("spelaion", &customer)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "collation")
+        .unwrap();
+    assert_eq!(engine.value, "utf8mb4_bin", "{label}");
+    let view_owner = conn.object_properties("spelaion", &view).await.unwrap();
+    assert!(
+        view_owner
+            .iter()
+            .any(|p| p.name == "owner" && p.value.starts_with("spelaion@")),
+        "{label}: {view_owner:?}"
+    );
+
+    let partitioning = conn
+        .table_partitions("spelaion", &orders)
+        .await
+        .unwrap()
+        .expect("partitioned");
+    assert_eq!(partitioning.method, "range", "{label}");
+    assert!(
+        partitioning.key.contains("year"),
+        "{label}: {}",
+        partitioning.key
+    );
+    let bounds: Vec<(String, Option<String>)> = partitioning
+        .partitions
+        .iter()
+        .map(|p| (p.name.clone(), p.bound.clone()))
+        .collect();
+    assert_eq!(
+        bounds,
+        [
+            (
+                "p2024".to_string(),
+                Some("VALUES LESS THAN (2025)".to_string())
+            ),
+            (
+                "p2025".to_string(),
+                Some("VALUES LESS THAN (2026)".to_string())
+            ),
+            (
+                "pmax".to_string(),
+                Some("VALUES LESS THAN (MAXVALUE)".to_string())
+            ),
+        ],
+        "{label}"
+    );
+    assert_eq!(
+        conn.table_partitions("spelaion", &customer).await.unwrap(),
+        None,
+        "{label}"
+    );
+
+    let line = |d: &spelaion_driver_api::DependencyInfo| format!("{:?} {}", d.kind, d.name);
+    let told = conn
+        .object_dependencies("spelaion", &customer)
+        .await
+        .unwrap()
+        .expect("told");
+    let used_by: Vec<String> = told.used_by.iter().map(line).collect();
+    assert!(
+        used_by.contains(&format!("ForeignKey det_child_{pid}")),
+        "{label}: {used_by:?}"
+    );
+    assert!(
+        used_by.contains(&format!("Trigger {trigger}")),
+        "{label}: {used_by:?}"
+    );
+    let view_deps = conn
+        .object_dependencies("spelaion", &view)
+        .await
+        .unwrap()
+        .expect("told");
+    if label == "mysql" {
+        assert!(
+            used_by.contains(&format!("View {view}")),
+            "{label}: {used_by:?}"
+        );
+        assert_eq!(
+            view_deps.uses.iter().map(line).collect::<Vec<_>>(),
+            [format!("Table {customer}")],
+            "{label}"
+        );
+    } else {
+        // MariaDB keeps no record of what a view reads.
+        assert!(
+            told.untracked
+                .contains(&spelaion_driver_api::DependencyKind::View),
+            "{label}"
+        );
+        assert!(
+            view_deps
+                .untracked
+                .contains(&spelaion_driver_api::DependencyKind::Table),
+            "{label}"
+        );
+    }
+    assert!(
+        conn.object_dependencies("spelaion", "nope_nope")
+            .await
+            .is_err(),
+        "{label}"
+    );
+}
+
 #[tokio::test]
 async fn explorer_lists_routines_triggers_events_and_accounts() {
     for server in servers() {
