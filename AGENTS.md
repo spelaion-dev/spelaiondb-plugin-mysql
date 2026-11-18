@@ -15,7 +15,11 @@ says only what is different in this repository.
   `MysqlDriver::mariadb()`). `mysql_async`, text protocol, one actor per connection. `DATE`,
   `DATETIME` and `TIMESTAMP` columns are text with their native type (legacy zero dates;
   ADR-005 and ADR-006 there). Bound values are bound to user variables with a prepared `SET`,
-  then read with the text protocol. Cancel is `KILL QUERY` from a second connection.
+  then read with the text protocol. Cancel is `KILL QUERY` from a second connection,
+  remembered for what was sent before it (`cancel.rs`, SpelaionDB's SDB-222): a queued
+  statement never starts, a running one is killed again until it ends, and the actor starts
+  nothing while a `KILL` is on its way, so it never reaches a later statement. `tests/cancel.rs`
+  cancels before, at and during a statement's start on both servers, each bounded to 10 s.
 - `src/bin/spelaiondb-plugin-mysql.rs`: the program. It hands the two drivers to
   `spelaion_plugin_sdk::run` and nothing else.
 - `tests/mysql.rs`: the type zoo, which compares every type with the server's text, on both
