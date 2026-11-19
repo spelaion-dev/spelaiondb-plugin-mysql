@@ -161,6 +161,41 @@ async fn database_selection_is_per_session_and_tracks_use() {
     }
 }
 
+#[tokio::test]
+async fn database_context_survives_backslashes_in_either_session_mode() {
+    for server in servers() {
+        let conn = server.connect().await;
+        run(&*conn, "SET SESSION sql_mode = ''").await.unwrap();
+        run(
+            &*conn,
+            "CREATE TEMPORARY TABLE context_backslashes (name VARCHAR(100))",
+        )
+        .await
+        .unwrap();
+        for sql in [
+            r"INSERT INTO context_backslashes VALUES ('O''Brien \\ back')",
+            r"INSERT INTO context_backslashes VALUES ('O\'Brien; USE fake')",
+            "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'",
+            r"INSERT INTO context_backslashes VALUES ('trailing\')",
+        ] {
+            run(&*conn, sql).await.unwrap();
+            assert_eq!(
+                conn.database_context().await.unwrap().as_deref(),
+                Some("spelaion"),
+                "{}: {sql}",
+                server.label
+            );
+        }
+        run(&*conn, "USE information_schema").await.unwrap();
+        assert_eq!(
+            conn.database_context().await.unwrap().as_deref(),
+            Some("information_schema"),
+            "{}",
+            server.label
+        );
+    }
+}
+
 async fn run_with(
     conn: &dyn Connection,
     sql: &str,

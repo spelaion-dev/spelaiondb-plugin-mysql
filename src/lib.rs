@@ -288,6 +288,7 @@ async fn actor(
                 events,
             } => {
                 let killed = || canceller.killed(id);
+                let no_backslash_escapes = no_backslash_escapes(&conn);
                 let outcome = if params.is_empty() {
                     execute(&mut conn, &sql, batch_size, &events, &killed).await
                 } else {
@@ -295,15 +296,16 @@ async fn actor(
                 };
                 canceller.end(id);
                 let complete = matches!(outcome, ExecutionOutcome::Complete);
-                context.observe(&sql, complete);
+                observe_database_context(&mut context, &sql, complete, no_backslash_escapes);
                 if matches!(outcome, ExecutionOutcome::Uncertain) {
                     context.refresh(None);
                 }
                 status_stale = !complete;
             }
             Request::Rows { sql, params, reply } => {
+                let no_backslash_escapes = no_backslash_escapes(&conn);
                 let result = rows(&mut conn, &sql, params).await;
-                context.observe(&sql, result.is_ok());
+                observe_database_context(&mut context, &sql, result.is_ok(), no_backslash_escapes);
                 if result.is_err() && !matches!(&result, Err(DriverError::Database { .. })) {
                     context.refresh(None);
                 }
@@ -361,6 +363,28 @@ async fn actor(
     }
     canceller.close();
     let _ = conn.disconnect().await;
+}
+
+/// Read the mode before the statement runs. The next OK packet may reflect a mode the
+/// statement itself set, and an ERR packet provides no reliable mode for a later statement.
+fn no_backslash_escapes(conn: &Conn) -> Option<bool> {
+    conn.last_ok_packet().map(|ok| {
+        ok.status_flags()
+            .contains(mysql_async::consts::StatusFlags::SERVER_STATUS_NO_BACKSLASH_ESCAPES)
+    })
+}
+
+fn observe_database_context(
+    context: &mut DatabaseContext,
+    sql: &str,
+    succeeded: bool,
+    no_backslash_escapes: Option<bool>,
+) {
+    if let Some(no_backslash_escapes) = no_backslash_escapes {
+        context.observe_mysql(sql, succeeded, no_backslash_escapes);
+    } else {
+        context.observe(sql, succeeded);
+    }
 }
 
 /// The server reports an open transaction in the status of every OK packet: with one open,
