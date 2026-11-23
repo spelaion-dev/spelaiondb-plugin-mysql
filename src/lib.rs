@@ -164,26 +164,27 @@ impl Driver for MysqlDriver {
             other => other,
         }
         .map_err(map_error)?;
-        // GreptimeDB speaks MySQL's protocol but cancels, and keys its rows, its own way. Its
-        // handshake gives another number than its `connection_id()`, which its process ids end
-        // with. Every other server keeps the handshake's id, exactly as before (a proxy may answer
-        // `connection_id()` with a server's id that its own `KILL` does not know).
         let mut conn = conn;
-        let greptime = match conn
-            .query_first::<(Option<String>, Option<u32>), _>("select version(), connection_id()")
-            .await
-        {
-            Ok(Some((Some(version), Some(id)))) if is_greptime(&version) => Some(id),
-            _ => None,
+        let server = Server::read(&mut conn).await;
+        // GreptimeDB's handshake gives another number than its `connection_id()`, which its
+        // process ids end with. Every other server keeps the handshake's id, exactly as before (a
+        // proxy may answer `connection_id()` with a server's id that its own `KILL` does not
+        // know).
+        let target = match server {
+            Server::Greptime(id) => cancel::CancelTarget::Greptime(id),
+            Server::Mysql | Server::StarRocks => cancel::CancelTarget::Mysql(conn.id()),
         };
-        let canceller = cancel::Canceller::new(
-            opts,
-            timeout,
-            match greptime {
-                Some(id) => cancel::CancelTarget::Greptime(id),
-                None => cancel::CancelTarget::Mysql(conn.id()),
-            },
-        );
+        // An import's prepared INSERT and a data search's prepared `SET` of user variables.
+        // GreptimeDB's prepared inserts do not convert the text every value is bound as
+        // ("Expected type: Float64, actual: MYSQL_TYPE_VAR_STRING"), and it has no user variables
+        // ("variable has no type information"); StarRocks 3.4 prepares neither ("This command is
+        // not supported in the prepared statement protocol yet", 1295). There the import and the
+        // data search are refused, not half done or sent.
+        let prepares_writes = match server {
+            Server::Mysql => true,
+            Server::Greptime(_) | Server::StarRocks => false,
+        };
+        let canceller = cancel::Canceller::new(opts, timeout, target);
         let (requests, receiver) = mpsc::channel(8);
         tokio::spawn(actor(
             conn,
@@ -196,20 +197,18 @@ impl Driver for MysqlDriver {
             sending: tokio::sync::Mutex::new(()),
             cancel: Arc::new(cancel::MysqlCancel(canceller)),
             flavor: self.flavor,
-            greptime: greptime.is_some(),
+            server,
             capabilities: Capabilities {
+                // GreptimeDB's and StarRocks's transactions open nothing; the app recognises them
+                // from the server itself and refuses manual commit and changes of several
+                // statements there, saying which server it is (SpelaionDB's SDB-310).
                 transactions: true,
                 cancel: true,
                 explain: true,
                 editable_results: false,
                 schemas: true,
-                // An import binds every value as text, which GreptimeDB's prepared inserts do not
-                // convert ("Expected type: Float64, actual: MYSQL_TYPE_VAR_STRING"): its import is
-                // refused, not half done.
-                insert_rows: greptime.is_none(),
-                // Values are bound to user variables, which GreptimeDB does not have ("variable
-                // has no type information"): its data search is refused, not sent.
-                bound_params: greptime.is_none(),
+                insert_rows: prepares_writes,
+                bound_params: prepares_writes,
             },
         }))
     }
@@ -656,14 +655,74 @@ struct MysqlConnection {
     sending: tokio::sync::Mutex<()>,
     cancel: Arc<cancel::MysqlCancel>,
     flavor: Flavor,
-    /// The server said it is GreptimeDB when the connection opened.
-    greptime: bool,
+    server: Server,
     capabilities: Capabilities,
+}
+
+/// Which server of MySQL's protocol the connection reached, read once when it opens: only the
+/// ones this driver treats differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Server {
+    /// MySQL, MariaDB and every server not named below, exactly as before.
+    Mysql,
+    /// GreptimeDB, with its `connection_id()`: it cancels, and keys its rows, its own way.
+    Greptime(u32),
+    /// StarRocks: it says it is MySQL, prepares no writes and lists its keys only in
+    /// `information_schema.columns`.
+    StarRocks,
+}
+
+impl Server {
+    /// GreptimeDB names itself in its `version()`. StarRocks answers as MySQL 8.0.33 with only
+    /// its release and commit as its comment (`3.4.5-1207fa7`): a comment of that shape is
+    /// checked against `current_version()`, StarRocks's own function, so MySQL is never asked
+    /// it. A server that does not answer is taken for MySQL. The comment is asked apart:
+    /// GreptimeDB refuses `@@version_comment` ("has no type information").
+    async fn read(conn: &mut Conn) -> Server {
+        match conn
+            .query_first::<(Option<String>, Option<u32>), _>("select version(), connection_id()")
+            .await
+        {
+            Ok(Some((Some(version), Some(id)))) if is_greptime(&version) => {
+                return Server::Greptime(id);
+            }
+            Ok(_) | Err(_) => {}
+        }
+        let comment = match conn
+            .query_first::<Option<String>, _>("select @@version_comment")
+            .await
+        {
+            Ok(Some(Some(comment))) if starrocks_comment(&comment) => comment,
+            Ok(_) | Err(_) => return Server::Mysql,
+        };
+        match conn
+            .query_first::<Option<String>, _>("select current_version()")
+            .await
+        {
+            Ok(Some(Some(current))) if current.trim() == comment.trim() => Server::StarRocks,
+            Ok(_) | Err(_) => Server::Mysql,
+        }
+    }
 }
 
 /// GreptimeDB's `version()` ends with its own name and release (`8.4.2-GreptimeDB-1.3.1`).
 fn is_greptime(version: &str) -> bool {
     version.to_ascii_lowercase().contains("greptimedb")
+}
+
+/// StarRocks's `@@version_comment`: a release of three numbers, `-` and a hex commit
+/// (`3.4.5-1207fa7`). MySQL's and its forks' comments name their distributor.
+fn starrocks_comment(comment: &str) -> bool {
+    let Some((release, commit)) = comment.trim().split_once('-') else {
+        return false;
+    };
+    let parts: Vec<&str> = release.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && !commit.is_empty()
+        && commit.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn closed() -> DriverError {
@@ -864,7 +923,7 @@ impl Connection for MysqlConnection {
     }
 
     async fn describe_table(&self, schema: &str, name: &str) -> Result<TableInfo> {
-        introspect::describe_table(self, self.flavor, self.greptime, schema, name).await
+        introspect::describe_table(self, self.flavor, self.server, schema, name).await
     }
 
     async fn list_columns(&self, schema: &str) -> Result<Vec<SchemaColumn>> {
@@ -963,6 +1022,27 @@ fn map_error_in(e: mysql_async::Error, sql: &str) -> DriverError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_bare_release_and_commit_looks_like_starrocks() {
+        for comment in ["3.4.5-1207fa7", " 3.3.12-ab12CD "] {
+            assert!(starrocks_comment(comment), "{comment:?}");
+        }
+        for comment in [
+            "MySQL Community Server - GPL",
+            "Source distribution",
+            "Percona Server (GPL), Release 30, Revision 1",
+            "mariadb.org binary distribution",
+            "3.4.5",
+            "3.4-1207fa7",
+            "3.4.5-",
+            "3.4.5-release",
+            "v3.4.5-1207fa7",
+            "",
+        ] {
+            assert!(!starrocks_comment(comment), "{comment:?}");
+        }
+    }
 
     #[test]
     fn the_cleartext_plugin_is_answered_only_when_the_core_says_so() {
