@@ -29,7 +29,10 @@ SPELAION_TEST_MYSQL=127.0.0.1:13306 SPELAION_TEST_MARIADB=127.0.0.1:13307 \
 ```
 
 runs the type zoo and the protocol's conformance set against this plugin's own program. A
-server whose variable is not set is skipped, which does not count as tested.
+server whose variable is not set is skipped, which does not count as tested. StarRocks
+(`tests/starrocks.rs`, `SPELAION_TEST_STARROCKS`) is not among them, nor in CI: its image is
+about 8 GB. Run it against SpelaionDB's `testing/docker/mysql-family` (`127.0.0.1:19030`) when
+the driver changes how it reads a server, a table's keys or what it prepares.
 
 To try a build with SpelaionDB, point a development build of it at the program
 (`SPELAION_DEV_PLUGIN_MYSQL` and `SPELAION_DEV_PLUGIN_MARIADB`, both

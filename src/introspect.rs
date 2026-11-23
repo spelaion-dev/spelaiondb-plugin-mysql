@@ -6,7 +6,7 @@ use spelaion_driver_api::{
     ObjectInfo, ObjectKind, ReferencingKey, Result, SchemaColumn, SchemaInfo, TableInfo,
 };
 
-use crate::{Flavor, MysqlConnection};
+use crate::{Flavor, MysqlConnection, Server};
 
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
 
@@ -169,6 +169,17 @@ async fn greptime_row_key(
     Ok(primary_key)
 }
 
+/// A StarRocks table's primary key: the columns whose `column_key` (the seventh value of a row
+/// of `describe_table`'s column query) is `PRI`, in their order. A duplicate key table says
+/// `DUP` and keeps equal rows, a unique key table says `UNI`: neither has a primary key.
+fn starrocks_primary_key(column_rows: &[Vec<Option<String>>]) -> Vec<String> {
+    column_rows
+        .iter()
+        .filter(|row| opt(row, 6).as_deref() == Some("PRI"))
+        .map(|row| text(row, 0))
+        .collect()
+}
+
 /// Whether GreptimeDB's `create_options` say the table keeps duplicate rows.
 fn is_append_only(options: &str) -> bool {
     options
@@ -179,7 +190,7 @@ fn is_append_only(options: &str) -> bool {
 pub(crate) async fn describe_table(
     conn: &MysqlConnection,
     flavor: Flavor,
-    greptime: bool,
+    server: Server,
     schema: &str,
     name: &str,
 ) -> Result<TableInfo> {
@@ -191,15 +202,17 @@ pub(crate) async fn describe_table(
         .map(|row| object(row))
         .ok_or_else(|| DriverError::Other(format!("{schema}.{name} does not exist")))?;
 
-    let columns = conn
+    let column_rows = conn
         .rows(
-            "select column_name, column_type, is_nullable, column_default, column_comment, extra
+            "select column_name, column_type, is_nullable, column_default, column_comment, extra,
+                    column_key
              from information_schema.columns
              where table_schema = ? and table_name = ?
              order by ordinal_position",
             params(),
         )
-        .await?
+        .await?;
+    let columns = column_rows
         .iter()
         .map(|row| {
             // MariaDB quotes string defaults (`'x'`) and writes NULL as the text `NULL`.
@@ -242,11 +255,18 @@ pub(crate) async fn describe_table(
         .find(|(index, _, _)| index == "PRIMARY")
         .map(|(_, _, columns)| columns.clone())
         .unwrap_or_default();
-    // GreptimeDB identifies a row by its primary key *and* its time index (two rows may share
-    // the key at different times): a page or an edit by the key alone would reach every one.
-    // Only on GreptimeDB: on MySQL an index of that name is any index, unique or not.
-    if greptime {
-        primary_key = greptime_row_key(conn, schema, name, primary_key, &indexes).await?;
+    match server {
+        // GreptimeDB identifies a row by its primary key *and* its time index (two rows may share
+        // the key at different times): a page or an edit by the key alone would reach every one.
+        // Only on GreptimeDB: on MySQL an index of that name is any index, unique or not.
+        Server::Greptime(_) => {
+            primary_key = greptime_row_key(conn, schema, name, primary_key, &indexes).await?;
+        }
+        // StarRocks lists no index in `statistics`: only a primary key table's columns say `PRI`,
+        // its key columns being its first ones, in key order. Only on StarRocks: MySQL also says
+        // `PRI` for a unique index when a table has no primary key.
+        Server::StarRocks => primary_key = starrocks_primary_key(&column_rows),
+        Server::Mysql => {}
     }
     let indexes = indexes
         .into_iter()
@@ -443,7 +463,28 @@ fn group_referencing_keys(rows: &[Vec<Option<String>>]) -> Vec<ReferencingKey> {
 mod tests {
     use spelaion_driver_api::DriverError;
 
-    use super::{is_append_only, missing_catalog_table};
+    use super::{is_append_only, missing_catalog_table, starrocks_primary_key};
+
+    /// StarRocks 3.4.5's `column_key`s: `PRI` on a primary key table, `DUP` and `UNI` on the
+    /// others, which have no primary key.
+    #[test]
+    fn a_starrocks_primary_key_is_its_pri_columns_in_order() {
+        let row = |name: &str, key: Option<&str>| {
+            let mut row = vec![Some(name.to_string()); 6];
+            row.push(key.map(str::to_string));
+            row
+        };
+        let pk = [
+            row("b", Some("PRI")),
+            row("a", Some("PRI")),
+            row("v", Some("")),
+        ];
+        assert_eq!(starrocks_primary_key(&pk), ["b", "a"]);
+        for key in ["DUP", "UNI", ""] {
+            let other = [row("id", Some(key)), row("v", None)];
+            assert!(starrocks_primary_key(&other).is_empty(), "{key}");
+        }
+    }
 
     /// GreptimeDB's `create_options`, as 1.3.1 writes them for `WITH (...)`.
     #[test]
