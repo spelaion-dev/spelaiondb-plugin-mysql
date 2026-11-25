@@ -1282,3 +1282,66 @@ async fn a_session_past_wait_timeout_is_a_connection_error() {
         }
     }
 }
+
+/// A column of bytes loads every byte as it is into a `longblob` and a `varbinary`, the empty
+/// bytes and NULL apart, as the server reads them itself (SDB-464).
+#[tokio::test]
+async fn insert_rows_loads_bytes_as_they_are() {
+    use spelaion_driver_api::{Cell, ColumnKind, InsertTarget, TextRows};
+    for server in servers() {
+        let conn = server.connect().await;
+        assert!(conn.capabilities().insert_bytes, "{}", server.label);
+        let table = format!("bytes_{}", std::process::id());
+        run(&*conn, &format!("drop table if exists {table}"))
+            .await
+            .unwrap();
+        run(
+            &*conn,
+            &format!("create table {table} (id int, data longblob, short varbinary(300))"),
+        )
+        .await
+        .unwrap();
+        let every: Vec<u8> = (0..=255).collect();
+        let kinds = [ColumnKind::Text, ColumnKind::Bytes, ColumnKind::Bytes];
+        let mut rows = TextRows::builder_with(&kinds);
+        rows.push_cells([
+            Some(Cell::Text("1")),
+            Some(Cell::Bytes(&every)),
+            Some(Cell::Bytes(&every)),
+        ])
+        .unwrap();
+        rows.push_cells([
+            Some(Cell::Text("2")),
+            Some(Cell::Bytes(&[])),
+            Some(Cell::Bytes(&[])),
+        ])
+        .unwrap();
+        rows.push_cells([Some(Cell::Text("3")), None, None])
+            .unwrap();
+        let target = InsertTarget {
+            schema: String::new(),
+            table: table.clone(),
+            columns: vec!["id".into(), "data".into(), "short".into()],
+        };
+        assert_eq!(conn.insert_rows(&target, rows.finish()).await.unwrap(), 3);
+        let mut reference = server.reference().await;
+        let read: Vec<(i32, Option<String>, Option<String>)> = reference
+            .query(format!(
+                "select id, lower(hex(data)), lower(hex(short)) from {table} order by id"
+            ))
+            .await
+            .unwrap();
+        let hex: String = every.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            read,
+            [
+                (1, Some(hex.clone()), Some(hex)),
+                (2, Some(String::new()), Some(String::new())),
+                (3, None, None),
+            ],
+            "{}",
+            server.label
+        );
+        run(&*conn, &format!("drop table {table}")).await.unwrap();
+    }
+}

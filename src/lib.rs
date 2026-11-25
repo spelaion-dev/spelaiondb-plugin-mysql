@@ -22,7 +22,7 @@ use futures_util::StreamExt;
 use mysql_async::prelude::Queryable;
 use mysql_async::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts};
 use spelaion_driver_api::{
-    CancelHandle, Capabilities, ColumnMeta, ConnectParams, Connection, ContextDialect,
+    CancelHandle, Capabilities, Cell, ColumnMeta, ConnectParams, Connection, ContextDialect,
     DatabaseContext, Dialect, Driver, DriverError, EventStream, ExecEvent, ExecOptions,
     InsertTarget, KeepAlive, LikeFilter, NameFilter, Notice, ObjectInfo, ReferencingKey, Result,
     ResultSchema, SchemaColumn, SchemaInfo, SchemaObject, ServerObject, TableInfo, TextRows,
@@ -209,6 +209,8 @@ impl Driver for MysqlDriver {
                 schemas: true,
                 insert_rows: prepares_writes,
                 bound_params: prepares_writes,
+                // Bound as they are, like text: a binary column keeps them (SDB-464).
+                insert_bytes: prepares_writes,
             },
         }))
     }
@@ -249,7 +251,8 @@ enum Request {
     /// A multi-row INSERT of an import (ADR-038): `?` placeholders, values bound.
     Insert {
         sql: String,
-        values: Vec<Option<String>>,
+        /// Each value's bytes: a text's UTF-8, or the bytes of a binary column (SDB-464).
+        values: Vec<Option<Vec<u8>>>,
         reply: oneshot::Sender<Result<u64>>,
     },
 }
@@ -332,7 +335,7 @@ async fn actor(
             Request::Insert { sql, values, reply } => {
                 let params: Vec<mysql_async::Value> = values
                     .into_iter()
-                    .map(|v| v.map_or(mysql_async::Value::NULL, |t| t.into_bytes().into()))
+                    .map(|v| v.map_or(mysql_async::Value::NULL, mysql_async::Value::Bytes))
                     .collect();
                 let result = conn
                     .exec_drop(sql.as_str(), mysql_async::Params::Positional(params))
@@ -861,8 +864,13 @@ impl Connection for MysqlConnection {
                 .send(Request::Insert {
                     sql,
                     values: (0..chunk.len())
-                        .flat_map(|row| chunk.row(row))
-                        .map(|value| value.map(str::to_string))
+                        .flat_map(|row| chunk.cells(row))
+                        .map(|value| {
+                            value.map(|cell| match cell {
+                                Cell::Text(text) => text.as_bytes().to_vec(),
+                                Cell::Bytes(bytes) => bytes.to_vec(),
+                            })
+                        })
                         .collect(),
                     reply,
                 })
