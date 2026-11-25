@@ -300,7 +300,10 @@ pub(crate) async fn object_definition(
         | SchemaObjectKind::Enum
         | SchemaObjectKind::Domain
         | SchemaObjectKind::Type
-        | SchemaObjectKind::Synonym => {
+        | SchemaObjectKind::Synonym
+        | SchemaObjectKind::Sink
+        | SchemaObjectKind::Connection
+        | SchemaObjectKind::Secret => {
             return Err(DriverError::Other(format!(
                 "MySQL has no {:?} objects",
                 object.kind
